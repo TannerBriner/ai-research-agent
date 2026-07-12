@@ -24,41 +24,29 @@ across a long generation is a common failure point for LLMs -- string
 matching in Python is guaranteed correct every time.
 """
 
-import os          # for reading environment variables (API keys, model override)
-import re          # for the citation-finding/rewriting regex in convert_citations()
-import sys         # for sys.exit() when required API keys are missing
-import argparse    # for parsing the command-line topic/output arguments
-from datetime import date          # for the "Generated on <date>" line in the saved file
-from urllib.parse import urlparse  # for pulling a short site name (e.g. "akc.org") out of each URL
+import os
+import re
+import sys
+import argparse
+from datetime import date
+from urllib.parse import urlparse
 
-from dotenv import load_dotenv   # reads key=value pairs out of a local .env file into os.environ
-import anthropic                 # Anthropic's official Python SDK -- talks to the Claude API
-from tavily import TavilyClient  # Tavily's official Python SDK -- talks to the Tavily search API
+from dotenv import load_dotenv
+import anthropic
+from tavily import TavilyClient
 
-# load_dotenv() reads the .env file (if present) in the current directory and
-# copies its key=value pairs into os.environ, so the os.environ.get() calls
-# just below can find them. This keeps real secrets out of the source code.
+
 load_dotenv()
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 
-# Verify the current model ID at https://docs.anthropic.com/en/docs/about-claude/models
-# before running -- model slugs change over time and this default may be stale.
 # ANTHROPIC_MODEL can be set in .env to override this without touching code.
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
-# Safety valve on the agent loop below: caps how many back-and-forth
-# "search, read results, decide what to do next" cycles the agent can run
-# for a single topic, so a stubborn/looping model can't run forever (and
-# rack up API costs) on one request.
+# Safety valve: caps agent turns so a looping model can't run (and bill) forever.
 MAX_AGENT_TURNS = 15
 
-# This system prompt is the agent's entire "job description." It tells the
-# model both what to do (research, using the tool) and exactly how its
-# final output should be formatted, so the rest of this script can
-# reliably post-process that output (see convert_citations() and
-# strip_preamble() below).
 SYSTEM_PROMPT = """You are an autonomous research agent. Given a research topic, your job is to:
 
 1. Break it into 2-4 concrete sub-questions worth investigating.
@@ -121,13 +109,7 @@ information, let me write the report" -- go straight to the "#" heading).
 
 def web_search_tool_definition():
     """
-    Describes the web_search tool to Claude in the exact schema the
-    Messages API's tool-use feature expects: a name, a plain-English
-    description (the model reads this to decide WHEN to call the tool),
-    and a JSON Schema for its input (here, just one required string field,
-    "query"). Claude never actually executes this function itself -- it
-    just decides to call it and supplies the "query" argument; our code
-    below is what actually runs the search and hands the results back.
+    Tool schema for web_search, in the format the Messages API expects.
     """
     return {
         "name": "web_search",
@@ -186,34 +168,24 @@ def run_research_agent(topic, max_turns=MAX_AGENT_TURNS, verbose=True):
     has enough information and writes the final report instead of calling
     the tool again.
     """
-    # Two separate API clients: one for the LLM (Anthropic), one for web
-    # search (Tavily). The agent loop below is what ties them together.
+
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 
-    # `messages` is the running conversation history sent to Claude on
-    # every turn. It starts with just the user's research request, and we
-    # append to it as the loop progresses (Claude's responses, and our
-    # tool results) so each new API call has full context of everything
-    # that happened before it.
+    # `messages` is the running conversation history sent to Claude on every turn.
     messages = [
         {
             "role": "user",
             "content": f"Research this topic and produce a cited report: {topic}",
         }
     ]
-    # Tracks every source Claude actually searched and saw, across every
-    # turn of the loop -- used only for the "Sources consulted" count
-    # printed at the end (the report's own citations are handled
-    # separately by convert_citations(), based on what Claude actually
-    # cited rather than everything it merely saw).
+    # Tracks every source Claude actually searched and saw, across every turn of the loop
     sources_used = []
 
     for turn in range(max_turns):
         # Ask Claude to continue: read the conversation so far and either
         # (a) call the web_search tool again, or (b) write the final
-        # report. Which one happens is entirely the model's decision --
-        # that's what makes this "agentic" rather than scripted.
+        # report. Which one happens is entirely the model's decision.
         response = client.messages.create(
             model=MODEL,
             max_tokens=8192,
@@ -222,27 +194,19 @@ def run_research_agent(topic, max_turns=MAX_AGENT_TURNS, verbose=True):
             messages=messages,
         )
 
-        # Record Claude's response (whatever it was) into the running
-        # conversation history before we look at what it decided to do.
+        # Record Claude's response into the running conversation history.
         messages.append({"role": "assistant", "content": response.content})
 
         # response.stop_reason tells us WHY Claude stopped generating.
-        # "tool_use" means it wants to call web_search again; anything
-        # else (usually "end_turn") means it decided it's done and this
-        # response is the final report -- so we extract the plain text
-        # and return, ending the loop.
+        # "tool_use" means it wants to call web_search again.
         if response.stop_reason != "tool_use":
             final_text = "".join(
                 block.text for block in response.content if block.type == "text"
             )
             return final_text, sources_used
 
-        # Otherwise, Claude's response contains one or more tool_use
-        # blocks (it can request multiple searches in a single turn).
-        # We run each requested search for real, then package the results
-        # up as "tool_result" messages so Claude can read them on its next
-        # turn -- this is the hand-off point between "the model decided
-        # what to search" and "our code actually went and searched it."
+        # Otherwise, Claude's response contains one or more tool_use blocks.
+        # We run each requested search for real, then package the results.
         tool_results = []
         for block in response.content:
             if block.type == "tool_use" and block.name == "web_search":
@@ -257,21 +221,16 @@ def run_research_agent(topic, max_turns=MAX_AGENT_TURNS, verbose=True):
                 tool_results.append(
                     {
                         "type": "tool_result",
-                        # tool_use_id links this result back to the specific
-                        # tool call it's answering -- required by the API
-                        # when a single turn contains multiple tool calls.
+                        # tool_use_id links this result back to the specific tool call
                         "tool_use_id": block.id,
                         "content": format_search_results_for_claude(results),
                     }
                 )
-        # Tool results are sent back as a "user" turn (from the API's
-        # perspective, tool output is information arriving from outside
-        # the model, same as a user message would be).
+        # Tool results are sent back as a "user" turn
         messages.append({"role": "user", "content": tool_results})
 
     # If we fall out of the for-loop, Claude used up every allowed turn
-    # without ever stopping to write a final report -- most likely on an
-    # overly broad topic. Return a clear message instead of crashing.
+    # Return a clear message instead of crashing.
     return (
         "Agent did not converge to a final report within the turn limit. "
         "Consider raising max_turns or narrowing the topic.",
@@ -303,8 +262,7 @@ def strip_preamble(text):
     for i, line in enumerate(lines):
         if line.strip().startswith("#"):
             return "\n".join(lines[i:]).strip()
-    # Fallback: no heading found anywhere (shouldn't normally happen) --
-    # return the text as-is rather than silently deleting everything.
+    # Fallback: no heading found anywhere then return the text as-is rather than silently deleting everything.
     return text.strip()
 
 
@@ -350,32 +308,20 @@ def resolve_orphan_tags(body, order):
         any unresolvable ones reduced to plain text (bracket-stripped)
         rather than left as a dangling, meaningless reference.
     """
-    # Lowercase title -> citation number, so the lookup below is not
-    # case-sensitive (the model may write "landbase" inline but "Landbase"
-    # in its Sources section, or vice versa).
+    # Lowercase title -> citation number, so the lookup below is not case-sensitive
     title_to_number = {title.lower(): number for number, title, url in order}
 
-    # Matches a bracketed tag that STARTS WITH A LETTER -- this is what
-    # keeps this pattern from ever re-matching citation numbers we've
-    # already inserted, like "[1]" or "[12]", which start with a digit.
-    # The negative lookahead "(?!\()" excludes anything immediately
-    # followed by an opening paren, which would mean it's actually a
-    # proper [Label](URL) pair that the main pattern already handled
-    # (or, in rare cases, should be left for that pattern to handle).
+    # Matches a bracketed tag that STARTS WITH A LETTER.
     orphan_pattern = re.compile(r"\[([A-Za-z][^\]]*)\](?!\()")
 
     def replace_orphan(match):
         tag_text = match.group(1)
         number = title_to_number.get(tag_text.lower())
         if number is not None:
-            # Matched a known source -- rewrite the bare tag as our
-            # proper numbered citation, now in sync with Works Cited.
             return f"[{number}]"
-        # No matching source was ever collected for this tag (the model
-        # named a source but never gave us a URL for it anywhere). Rather
+        # No matching source was ever collected for this tag. Rather
         # than leave a bracketed reference that points nowhere, strip the
-        # brackets and keep the bare word(s) as plain text -- no content
-        # is deleted, it just stops looking like a citation.
+        # brackets and keep the bare word(s) as plain text
         return tag_text
 
     return orphan_pattern.sub(replace_orphan, body)
@@ -401,7 +347,7 @@ def convert_citations(report_text):
          the report, reuse its existing number instead of creating a
          duplicate entry.
       3. Replace each inline link with its ORIGINAL visible text plus a
-         bracketed number, e.g. [Title](URL) -> "Title [1]". The visible
+         bracketed number, e.g. [Title](URL) -> "(Title) [1]". The visible
          text is deliberately kept rather than discarded: the system
          prompt asks the model to only ever link a short source label
          (like "AKC"), but if it ever ignores that and wraps a whole
@@ -416,72 +362,41 @@ def convert_citations(report_text):
          the numbers always match between the inline citations and the
          list at the bottom.
     """
-    # Matches markdown links like [Some Title](https://example.com/page) --
     # group 1 captures the link text, group 2 captures the URL.
     link_pattern = re.compile(r"\[([^\]]+)\]\((https?://[^\s\)]+)\)")
 
-    seen_urls = {}   # url -> citation number already assigned to it
-    order = []       # (number, title, url) tuples in first-seen order
+    seen_urls = {}   # url -> citation number
+    order = []       # (number, title, url)
 
     def replace_link(match):
         title, url = match.group(1), match.group(2)
         if url not in seen_urls:
-            # First time this URL has been cited: assign it the next
-            # available number and record it for the Works Cited list.
+            # First time this URL has been cited: assign it the next available number and record it for the Works Cited list.
             number = len(order) + 1
             seen_urls[url] = number
             order.append((number, title, url))
         else:
             # Already cited earlier in the report: reuse the same number
-            # instead of creating a second entry for the same source.
             number = seen_urls[url]
-        # Keep `title` as plain visible text and append the citation
-        # number after it -- never discard it. If the model followed the
-        # system prompt's instruction, `title` is just a short tag like
-        # "AKC" and this reads as "AKC [1]". If the model ignored that
-        # instruction and wrapped a full sentence instead, this still
-        # preserves the whole sentence and simply appends "[1]" after
-        # it -- either way, no report content is ever lost.
-        #
-        # Always wrap the visible label in parentheses before the number,
-        # e.g. "AKC [1]" -> "(AKC) [1]". This is deliberately done here in
-        # code rather than left to the model: without it, a bare source
-        # name gets glued directly onto the sentence with no punctuation
-        # marking it as a citation, reading like a typo -- e.g. "...running
-        # in production Punku AI [1]" instead of the intended "...running
-        # in production (Punku AI) [1]". Checking for existing parentheses
-        # first avoids double-wrapping on the rare occasion the model
-        # already added its own, e.g. "(BLS)" -> stays "(BLS)", not "((BLS))".
+        # Keep `title` as plain visible text and append the citation number after it
+        # Always wrap the visible label in parentheses before the number
         display_title = title.strip()
         if not (display_title.startswith("(") and display_title.endswith(")")):
             display_title = f"({display_title})"
         return f"{display_title} [{number}]"
 
-    # re.sub walks the whole report and calls replace_link() on every
-    # match, building the numbered-citation version of the text in one pass.
+    # re.sub walks the whole report and calls replace_link() on every match
     body = link_pattern.sub(replace_link, report_text)
 
-    # The model was also asked to write its own "## Sources" section full
-    # of the same markdown links -- those links have now been turned into
-    # bare numbers by the substitution above, so that section is no longer
-    # useful. re.split on the "## Sources" (or "# Sources") heading and
-    # keeping only the text BEFORE it removes that now-broken section,
-    # leaving the rest of the report body intact.
     body = re.split(r"\n#{1,2}\s*Sources\b.*", body, flags=re.IGNORECASE | re.DOTALL)[0].rstrip()
 
     # Second safety net, for a different failure mode than the one above.
     # Sometimes the model skips the [Label](URL) format entirely and just
-    # drops a bare citation marker like "[Landbase]" into the sentence --
-    # a source name in brackets with no URL attached at all. Those never
-    # matched link_pattern (there's no "(url)" right after them), so they
-    # pass through untouched and would otherwise sit in the final report
-    # as dead-end references that don't point to anything. resolve_orphan_tags()
-    # catches these and reconnects them to the same numbering used above.
+    # drops a bare citation marker. 
+    # resolve_orphan_tags() catches these and reconnects them to the same numbering used above.
     body = resolve_orphan_tags(body, order)
 
-    # Build our own replacement, in citation order, using the exact same
-    # numbers assigned above -- this is what guarantees inline [3] and
-    # Works Cited entry 3 always refer to the same source.
+    # Build our own replacement, in citation order, using the exact same numbers assigned above
     works_cited_lines = ["## Works Cited\n"]
     for number, title, url in order:
         works_cited_lines.append(f'{number}. "{title}." {domain_from_url(url)}, {url}.')
@@ -490,9 +405,6 @@ def convert_citations(report_text):
 
 
 def main():
-    # argparse turns command-line arguments into a simple object
-    # (args.topic, args.output) instead of us having to parse sys.argv by
-    # hand, and it auto-generates --help text for free.
     parser = argparse.ArgumentParser(description="Autonomous research agent")
     parser.add_argument("topic", help="Research topic or question")
     parser.add_argument(
@@ -500,8 +412,7 @@ def main():
     )
     args = parser.parse_args()
 
-    # Fail fast with a clear message rather than letting the Anthropic/
-    # Tavily SDKs raise a confusing authentication error deeper in the code.
+    # Fail fast with a clear message
     if not ANTHROPIC_API_KEY or not TAVILY_API_KEY:
         print(
             "Error: set ANTHROPIC_API_KEY and TAVILY_API_KEY in a .env file "
@@ -511,22 +422,16 @@ def main():
 
     print(f"Researching: {args.topic}\n")
 
-    # This is where the actual agent loop (defined above) runs to completion.
     report, sources = run_research_agent(args.topic)
 
-    # Post-processing pipeline, in order: strip any leftover conversational
-    # preamble, then renumber citations and attach the Works Cited list.
+    # Post-processing pipeline
     report = strip_preamble(report)
     report = convert_citations(report)
 
-    # If the user didn't specify --output, build a filename automatically
-    # from the topic so every run produces a sensibly-named file without
-    # extra effort.
+    # If the user didn't specify --output, build a filename automatically from the topic
     output_path = args.output or f"example_reports/{slugify(args.topic)}.md"
 
-    # A short metadata line at the top of the file records when it was
-    # generated and what the original query was -- useful context for
-    # anyone (including future you) reading the report later.
+    # A short metadata line at the top of the file records when it was generated and what the original query was
     metadata = (
         f"*Generated {date.today().isoformat()} by the autonomous research "
         f"agent · query: \"{args.topic}\"*\n\n"
