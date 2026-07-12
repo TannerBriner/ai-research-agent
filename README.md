@@ -25,7 +25,7 @@ problem, as a hands-on demonstration of working with LLM tool-use APIs.
 - **Agent loop** (`run_research_agent()`): each turn, Claude reads the
   conversation so far and either calls `web_search` again or returns a
   final answer. The loop only ends when the model's `stop_reason` is no
-  longer `tool_use` — the model decides when it's done, capped at 8 turns
+  longer `tool_use` — the model decides when it's done, capped at 15 turns
   as a safety valve against runaway searching.
 - **Tool definition**: `web_search` is described to Claude via the
   Messages API's tool schema (name, description, JSON Schema input).
