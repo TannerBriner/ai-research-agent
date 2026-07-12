@@ -84,7 +84,7 @@ branches into sub-questions.
 ## How to run this
 
 ```bash
-git clone https://github.com/TannerBriner/ai-research-agent/tree/main
+git clone https://github.com/TannerBriner/ai-research-agent.git
 cd ai-research-agent
 pip install -r requirements.txt
 cp .env.example .env   # then fill in ANTHROPIC_API_KEY and TAVILY_API_KEY
