@@ -84,7 +84,7 @@ branches into sub-questions.
 ## How to run this
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/TannerBriner/ai-research-agent/tree/main
 cd ai-research-agent
 pip install -r requirements.txt
 cp .env.example .env   # then fill in ANTHROPIC_API_KEY and TAVILY_API_KEY
@@ -95,7 +95,7 @@ python src/research_agent.py "Is air frying actually healthier than deep frying?
 
 ```
 src/research_agent.py   — the agent loop, tool definition, and citation post-processing
-example_reports/         — sample generated reports (five topics, see Results above)
+example_reports/         — sample generated reports (four topics, see Results above)
 .env.example             — template for required API keys
 requirements.txt         — anthropic, tavily-python, python-dotenv
 ```
