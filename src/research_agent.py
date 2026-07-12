@@ -52,7 +52,7 @@ MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 # "search, read results, decide what to do next" cycles the agent can run
 # for a single topic, so a stubborn/looping model can't run forever (and
 # rack up API costs) on one request.
-MAX_AGENT_TURNS = 8
+MAX_AGENT_TURNS = 15
 
 # This system prompt is the agent's entire "job description." It tells the
 # model both what to do (research, using the tool) and exactly how its
@@ -442,7 +442,20 @@ def convert_citations(report_text):
         # instruction and wrapped a full sentence instead, this still
         # preserves the whole sentence and simply appends "[1]" after
         # it -- either way, no report content is ever lost.
-        return f"({title}) [{number}]"
+        #
+        # Always wrap the visible label in parentheses before the number,
+        # e.g. "AKC [1]" -> "(AKC) [1]". This is deliberately done here in
+        # code rather than left to the model: without it, a bare source
+        # name gets glued directly onto the sentence with no punctuation
+        # marking it as a citation, reading like a typo -- e.g. "...running
+        # in production Punku AI [1]" instead of the intended "...running
+        # in production (Punku AI) [1]". Checking for existing parentheses
+        # first avoids double-wrapping on the rare occasion the model
+        # already added its own, e.g. "(BLS)" -> stays "(BLS)", not "((BLS))".
+        display_title = title.strip()
+        if not (display_title.startswith("(") and display_title.endswith(")")):
+            display_title = f"({display_title})"
+        return f"{display_title} [{number}]"
 
     # re.sub walks the whole report and calls replace_link() on every
     # match, building the numbered-citation version of the text in one pass.
